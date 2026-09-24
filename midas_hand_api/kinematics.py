@@ -33,6 +33,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from importlib import resources
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -42,18 +43,21 @@ from .fourbar_lookup import PipDipLookup
 _LOOKUP_FILENAME = "pip_dip_linkage_lookup.csv"
 
 
-@lru_cache(maxsize=1)
-def _pip_dip_lookup() -> PipDipLookup:
-    """Load the packaged PIP-DIP lookup table once."""
+@lru_cache(maxsize=None)
+def _pip_dip_lookup(path: str | None = None) -> PipDipLookup:
+    """Load and cache the packaged or configured PIP-DIP lookup table."""
+
+    if path is not None:
+        return PipDipLookup.from_csv(Path(path))
 
     resource = resources.files(__package__).joinpath("assets", _LOOKUP_FILENAME)
     with resources.as_file(resource) as path:
         return PipDipLookup.from_csv(path)
 
 
-@lru_cache(maxsize=1)
-def _pip_dip_jacobian_table() -> tuple[np.ndarray, np.ndarray]:
-    lookup = _pip_dip_lookup()
+@lru_cache(maxsize=None)
+def _pip_dip_jacobian_table(path: str | None = None) -> tuple[np.ndarray, np.ndarray]:
+    lookup = _pip_dip_lookup(path)
     return lookup.q_pip, np.gradient(lookup.q_dip, lookup.q_pip)
 
 
@@ -69,6 +73,7 @@ def pip_to_dip_position(
     pip_rad: float | np.ndarray,
     *,
     clamp: bool = True,
+    lookup_path: str | Path | None = None,
 ) -> float | np.ndarray:
     """Map PIP joint position to the coupled passive DIP position.
 
@@ -78,7 +83,8 @@ def pip_to_dip_position(
             endpoint before interpolation.
     """
 
-    q_dip = _pip_dip_lookup().evaluate(pip_rad, clamp=clamp)["q_dip"]
+    path = None if lookup_path is None else str(Path(lookup_path).resolve())
+    q_dip = _pip_dip_lookup(path).evaluate(pip_rad, clamp=clamp)["q_dip"]
     return _maybe_scalar(pip_rad, q_dip)
 
 
@@ -86,10 +92,12 @@ def pip_to_dip_jacobian(
     pip_rad: float | np.ndarray,
     *,
     clamp: bool = True,
+    lookup_path: str | Path | None = None,
 ) -> float | np.ndarray:
     """Return ``d(DIP position) / d(PIP position)`` from the lookup table."""
 
-    q_pip, jacobian = _pip_dip_jacobian_table()
+    path = None if lookup_path is None else str(Path(lookup_path).resolve())
+    q_pip, jacobian = _pip_dip_jacobian_table(path)
     q = np.asarray(pip_rad, dtype=float)
     q_eval = np.clip(q, q_pip[0], q_pip[-1]) if clamp else q
     result = np.interp(q_eval, q_pip, jacobian)
@@ -101,6 +109,7 @@ def pip_to_dip_velocity(
     pip_rad: float | np.ndarray = 0.0,
     *,
     clamp: bool = True,
+    lookup_path: str | Path | None = None,
 ) -> float | np.ndarray:
     """Map PIP velocity to coupled passive DIP velocity.
 
@@ -109,7 +118,11 @@ def pip_to_dip_velocity(
     zero for backwards compatibility with the previous one-argument API.
     """
 
-    result = np.asarray(pip_to_dip_jacobian(pip_rad, clamp=clamp)) * np.asarray(
+    result = np.asarray(
+        pip_to_dip_jacobian(
+            pip_rad, clamp=clamp, lookup_path=lookup_path
+        )
+    ) * np.asarray(
         pip_vel_rad_s,
         dtype=float,
     )

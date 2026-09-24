@@ -178,12 +178,12 @@ class MidasHand:
         return self._client().read_hardware_error_status(self.motor_ids)
 
     def verify_models(self) -> dict[int, int]:
-        """Return responding motors whose model number is not XM335-T323-T."""
+        """Return responding motors whose model number differs from the config."""
 
         return {
             motor_id: model_number
             for motor_id, model_number in self.ping().items()
-            if model_number != ct.XM335_T323_MODEL_NUMBER
+            if model_number != self.config.expected_model_number
         }
 
     def set_positions(self, positions_rad: Sequence[float], clip: bool = True) -> None:
@@ -400,7 +400,8 @@ class MidasHand:
         for dof_idx in range(self.config.n_dof):
             if dof_idx in passive_map:
                 result[dof_idx] = kinematics.pip_to_dip_position(
-                    motor_pos[passive_map[dof_idx]]
+                    motor_pos[passive_map[dof_idx]],
+                    lookup_path=self.config.pip_dip_lookup,
                 )
             else:
                 result[dof_idx] = motor_pos[motor_idx]
@@ -427,6 +428,7 @@ class MidasHand:
                 result[dof_idx] = kinematics.pip_to_dip_velocity(
                     motor_vel[pip_motor_idx],
                     pip_rad=pip_rad,
+                    lookup_path=self.config.pip_dip_lookup,
                 )
             else:
                 result[dof_idx] = motor_vel[motor_idx]
@@ -508,12 +510,27 @@ class MidasHand:
         sequence of the same length as motor_ids for per-motor values.
         """
         ids = list(motor_ids) if motor_ids is not None else self.motor_ids
-        vals = (
+        vals_ma = (
             [current_ma] * len(ids)
             if np.isscalar(current_ma)
             else list(current_ma)
         )
-        self._client().sync_write(ids, vals, ct.ADDR_GOAL_CURRENT, ct.LEN_GOAL_CURRENT)
+        if len(vals_ma) != len(ids):
+            raise ValueError(f"Expected {len(ids)} current values")
+        if any(
+            not np.isfinite(value)
+            or value < 0
+            or value > self.config.max_current_limit_ma
+            for value in vals_ma
+        ):
+            raise ValueError(
+                "current_ma must be finite and between 0 and "
+                f"{self.config.max_current_limit_ma} for "
+                f"{self.config.motor_model}"
+            )
+        self._client().sync_write(
+            ids, vals_ma, ct.ADDR_GOAL_CURRENT, ct.LEN_GOAL_CURRENT
+        )
 
     def set_motion_profile(
         self,
@@ -524,9 +541,7 @@ class MidasHand:
         """Set Dynamixel position-profile velocity and acceleration.
 
         ``None`` or ``0.0`` writes ``0`` for either profile value, disabling
-        that profile limit. ``configure()`` sets the XM335 actuators to
-        velocity-based profile mode, where acceleration is written in units of
-        214.577 rev/min^2.
+        that profile limit. Both supported motors use the same profile units.
         """
 
         ids = list(motor_ids) if motor_ids is not None else self.motor_ids
@@ -623,7 +638,7 @@ def _profile_acceleration_rad_s2_to_raw(acceleration_rad_s2: float) -> int:
     if acceleration_rad_s2 == 0:
         return 0
     raw = int(
-        round(acceleration_rad_s2 / ct.XM335_T323_PROFILE_ACCELERATION_UNIT_RAD_S2)
+        round(acceleration_rad_s2 / ct.X_SERIES_PROFILE_ACCELERATION_UNIT_RAD_S2)
     )
     return max(1, raw)
 
