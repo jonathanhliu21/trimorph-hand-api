@@ -1,7 +1,9 @@
 from importlib import resources
 
 import numpy as np
+import pytest
 
+from midas_hand_api.config import HandConfig
 from midas_hand_api.fourbar_lookup import FourBarPipDipMapping, PipDipLookup
 from midas_hand_api.hand import MidasHand
 from midas_hand_api.kinematics import (
@@ -62,8 +64,31 @@ def test_velocity_keeps_one_argument_home_position_default() -> None:
     )
 
 
-def test_hand_velocity_expansion_uses_pip_positions_for_passive_joints() -> None:
-    hand = MidasHand(autoconnect=False)
+def test_custom_lookup_interpolates_position_and_velocity(tmp_path) -> None:
+    lookup = tmp_path / "custom_lookup.csv"
+    lookup.write_text(
+        "q_pip,q_dip,q_linkage_base,q_linkage_distal\n"
+        "0,0,0,0\n1,2,0,0\n2,4,0,0\n",
+        encoding="utf-8",
+    )
+
+    assert pip_to_dip_position(0.5, lookup_path=str(lookup)) == pytest.approx(1.0)
+    assert pip_to_dip_velocity(
+        3.0,
+        pip_rad=0.5,
+        lookup_path=str(lookup),
+    ) == pytest.approx(6.0)
+
+
+@pytest.mark.parametrize(
+    "config",
+    [HandConfig(), HandConfig.xl330_m077()],
+    ids=["xm335", "xl330"],
+)
+def test_hand_velocity_expansion_uses_pip_positions_for_passive_joints(
+    config: HandConfig,
+) -> None:
+    hand = MidasHand(config, autoconnect=False)
     motor_pos = np.linspace(0.0, 0.6, hand.config.n_motors)
     motor_vel = np.linspace(0.1, 1.3, hand.config.n_motors)
 
