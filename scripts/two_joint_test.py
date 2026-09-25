@@ -66,8 +66,8 @@ MOTOR_LABELS = {
     12: "Ring MCP abduct",
 }
 
-PROFILE_MOVE_VELOCITY_RAD_S = 1.5
-PROFILE_MOVE_ACCELERATION_RAD_S2 = 7.5
+PROFILE_MOVE_VELOCITY_RAD_S = 3.0
+PROFILE_MOVE_ACCELERATION_RAD_S2 = 50.0
 POSITION_TOLERANCE_RAD = 0.1
 PROFILE_MOVE_TIMEOUT_S = 4.0
 STREAM_MOVE_RATE_HZ = 30.0
@@ -461,11 +461,10 @@ def _run_stream_move(args: argparse.Namespace, config: HandConfig) -> None:
             if args.settle_s > 0:
                 time.sleep(args.settle_s)
 
-            # Zero profile limits make each small streamed setpoint take effect
-            # immediately instead of starting a new slow onboard motion profile.
+            # set motion profile before streaming
             hand.set_motion_profile(
-                profile_velocity_rad_s=None,
-                profile_acceleration_rad_s2=0.0,
+                profile_velocity_rad_s=PROFILE_MOVE_VELOCITY_RAD_S,
+                profile_acceleration_rad_s2=PROFILE_MOVE_ACCELERATION_RAD_S2,
                 motor_ids=test_motor_ids,
             )
 
