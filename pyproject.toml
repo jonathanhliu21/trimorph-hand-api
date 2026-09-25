@@ -16,6 +16,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+graph = [
+    "matplotlib>=3.8",
+]
 qt = [
     "pyqtgraph>=0.13.7",
     "PyQt6>=6.6",
