@@ -1,12 +1,14 @@
-"""Hardware bring-up CLI for a two-joint XL330 test fixture.
+"""Hardware bring-up CLI for an XL330 finger test fixture.
 
 The commands mirror ``xl330_hand_test.py``, but every bus operation is limited
-to exactly two selected motor IDs.  By default those are the index-finger PIP
-and MCP-flex motors (IDs 4 and 5 in the full-hand configuration).
+to the selected motor IDs. By default those are the index-finger PIP and
+MCP-flex motors (IDs 4 and 5 in the full-hand configuration). If a third motor
+is added, it is treated as the MCP AB/AD motor.
 
 Run from the repository root, for example:
 
     .venv/bin/python scripts/two_joint_test.py record
+    .venv/bin/python scripts/two_joint_test.py record --motors 5
     .venv/bin/python scripts/two_joint_test.py profile_move_sequential
     .venv/bin/python scripts/two_joint_test.py profile_move --motors 4
     .venv/bin/python scripts/two_joint_test.py stream_move --motors 4,5
@@ -42,13 +44,15 @@ from midas_hand_api import HandConfig, MidasHand, home_hand  # noqa: E402
 
 
 DEFAULT_CONFIG_PATH = Path(__file__).with_name("xl330_test_config.yaml")
-DEFAULT_MOTOR_IDS = (4, 5)
+# Joint order is significant: PIP, MCP flexion, then optionally one ABAD motor.
+DEFAULT_MOTOR_IDS = (4, 5)  # Append motor 6 when ABAD is ready.
 
-# Review these calibrated targets before moving hardware. Positive joint angle
-# is provisionally treated as closing; joint_signs in the YAML must make that
-# convention true for both selected motors.
-OPEN_ANGLE_RAD = 0.0
-CLOSE_ANGLE_RAD = -1.0
+# Review these calibrated targets before moving hardware. The YAML joint signs
+# must make these calibrated targets move each joint in the intended direction.
+FLEXION_OPEN_ANGLE_RAD = 0.0
+FLEXION_CLOSE_ANGLE_RAD = -1.0
+AB_AD_OPEN_ANGLE_RAD = 0.2
+AB_AD_CLOSE_ANGLE_RAD = 0.0
 
 MOTOR_LABELS = {
     0: "Thumb IP",
@@ -162,11 +166,22 @@ def _parse_motor_ids(value: str) -> tuple[int, ...]:
     return result
 
 
-def _parse_two_motor_ids(value: str) -> tuple[int, int]:
+def _parse_fixture_motor_ids(value: str) -> tuple[int, ...]:
     result = _parse_motor_ids(value)
-    if len(result) != 2:
-        raise argparse.ArgumentTypeError("exactly two motor IDs are required")
+    expected_count = len(DEFAULT_MOTOR_IDS)
+    if len(result) != expected_count:
+        raise argparse.ArgumentTypeError(
+            f"exactly {expected_count} motor IDs are required"
+        )
     return result
+
+
+def _motion_angles(motor_id: int) -> tuple[float, float]:
+    """Return the open and closed targets for a flexion or AB/AD motor."""
+
+    if len(DEFAULT_MOTOR_IDS) > 2 and motor_id == DEFAULT_MOTOR_IDS[2]:
+        return AB_AD_OPEN_ANGLE_RAD, AB_AD_CLOSE_ANGLE_RAD
+    return FLEXION_OPEN_ANGLE_RAD, FLEXION_CLOSE_ANGLE_RAD
 
 
 def _load_config(path: Path, motor_ids: Sequence[int]) -> HandConfig:
@@ -185,7 +200,7 @@ def _require_reviewed_config(path: Path) -> None:
     if data.get("placeholders_unreviewed", True):
         raise RuntimeError(
             "Motion refused: review joint limits, joint signs, homing directions, "
-            "CAD offsets, and OPEN_ANGLE_RAD/CLOSE_ANGLE_RAD in this script, then "
+            "CAD offsets and the motion angle constants in this script, then "
             "set placeholders_unreviewed: false in the YAML."
         )
 
@@ -301,7 +316,7 @@ def _selected_motor_ids(
     unknown_ids = sorted(set(selected) - set(config.motor_ids))
     if unknown_ids:
         raise ValueError(
-            f"Motion motor IDs {unknown_ids} are not in the two-joint fixture "
+            f"Selected motor IDs {unknown_ids} are not in the fixture "
             f"{list(config.motor_ids)}"
         )
     return tuple(selected)
@@ -316,11 +331,15 @@ def _run_profile_move(args: argparse.Namespace, config: HandConfig) -> None:
 
     test_motor_ids = _selected_motor_ids(args, config)
     for motor_id in test_motor_ids:
-        _check_move_target(config, motor_id, CLOSE_ANGLE_RAD)
-        _check_move_target(config, motor_id, OPEN_ANGLE_RAD)
+        open_angle, close_angle = _motion_angles(motor_id)
+        _check_move_target(config, motor_id, close_angle)
+        _check_move_target(config, motor_id, open_angle)
     print(f"Selected motor IDs = {list(config.motor_ids)}")
-    print(f"OPEN_ANGLE_RAD     = {OPEN_ANGLE_RAD}")
-    print(f"CLOSE_ANGLE_RAD    = {CLOSE_ANGLE_RAD}")
+    print(f"FLEXION_OPEN_ANGLE_RAD  = {FLEXION_OPEN_ANGLE_RAD}")
+    print(f"FLEXION_CLOSE_ANGLE_RAD = {FLEXION_CLOSE_ANGLE_RAD}")
+    if len(DEFAULT_MOTOR_IDS) > 2:
+        print(f"AB_AD_OPEN_ANGLE_RAD    = {AB_AD_OPEN_ANGLE_RAD}")
+        print(f"AB_AD_CLOSE_ANGLE_RAD   = {AB_AD_CLOSE_ANGLE_RAD}")
     if args.skip_target_safety:
         print("WARNING: target timeout failures will not stop this movement sequence")
     _confirm_motion("Profile move testing", args.yes)
@@ -341,10 +360,11 @@ def _run_profile_move(args: argparse.Namespace, config: HandConfig) -> None:
             for motor_id in test_motor_ids:
                 motor_index = hand.motor_ids.index(motor_id)
                 label = MOTOR_LABELS.get(motor_id, "unlabelled joint")
+                open_angle, close_angle = _motion_angles(motor_id)
                 print(
                     f"Motor {motor_id} ({label}): closing to "
-                    f"{CLOSE_ANGLE_RAD:.3f} rad, then opening to "
-                    f"{OPEN_ANGLE_RAD:.3f} rad"
+                    f"{close_angle:.3f} rad, then opening to "
+                    f"{open_angle:.3f} rad"
                 )
                 try:
                     # Establish a non-jumping goal before enabling this motor alone.
@@ -358,12 +378,12 @@ def _run_profile_move(args: argparse.Namespace, config: HandConfig) -> None:
                     hand.enable_torque([motor_id])
 
                     target = np.array(hold_position, copy=True)
-                    target[motor_index] = CLOSE_ANGLE_RAD
+                    target[motor_index] = close_angle
                     hand.set_positions(target)
                     _wait_for_motor(
                         hand,
                         motor_id,
-                        CLOSE_ANGLE_RAD,
+                        close_angle,
                         args.timeout_s,
                         None
                         if current_recorder is None
@@ -372,12 +392,12 @@ def _run_profile_move(args: argparse.Namespace, config: HandConfig) -> None:
                     )
                     time.sleep(args.pause_s)
 
-                    target[motor_index] = OPEN_ANGLE_RAD
+                    target[motor_index] = open_angle
                     hand.set_positions(target)
                     _wait_for_motor(
                         hand,
                         motor_id,
-                        OPEN_ANGLE_RAD,
+                        open_angle,
                         args.timeout_s,
                         None
                         if current_recorder is None
@@ -399,22 +419,29 @@ def _run_stream_move(args: argparse.Namespace, config: HandConfig) -> None:
 
     _require_reviewed_config(args.config)
     test_motor_ids = _selected_motor_ids(args, config)
+    open_angles = np.array(
+        [_motion_angles(motor_id)[0] for motor_id in test_motor_ids]
+    )
+    close_angles = np.array(
+        [_motion_angles(motor_id)[1] for motor_id in test_motor_ids]
+    )
     for motor_id in test_motor_ids:
-        _check_move_target(config, motor_id, OPEN_ANGLE_RAD)
-        _check_move_target(config, motor_id, CLOSE_ANGLE_RAD)
+        open_angle, close_angle = _motion_angles(motor_id)
+        _check_move_target(config, motor_id, open_angle)
+        _check_move_target(config, motor_id, close_angle)
     sample_count = max(2, int(round(args.duration_s * args.rate_hz)) + 1)
     leg_times = np.linspace(0.0, args.duration_s, sample_count)
-    close_samples = np.linspace(OPEN_ANGLE_RAD, CLOSE_ANGLE_RAD, sample_count)
-    open_samples = np.linspace(CLOSE_ANGLE_RAD, OPEN_ANGLE_RAD, sample_count)
+    close_samples = np.linspace(open_angles, close_angles, sample_count)
+    open_samples = np.linspace(close_angles, open_angles, sample_count)
 
     # Do not send the closed endpoint twice at the turnaround. Keeping one copy
     # also preserves the requested setpoint interval across both legs.
     sample_times = np.concatenate((leg_times, args.duration_s + leg_times[1:]))
-    samples = np.concatenate((close_samples, open_samples[1:]))
+    samples = np.concatenate((close_samples, open_samples[1:]), axis=0)
 
     print(f"Selected motor IDs = {list(test_motor_ids)}")
-    print(f"OPEN_ANGLE_RAD     = {OPEN_ANGLE_RAD}")
-    print(f"CLOSE_ANGLE_RAD    = {CLOSE_ANGLE_RAD}")
+    print(f"Open angles (rad)  = {open_angles.tolist()}")
+    print(f"Close angles (rad) = {close_angles.tolist()}")
     if args.skip_target_safety:
         print("WARNING: target timeout failures will not stop this movement sequence")
     print(
@@ -441,7 +468,7 @@ def _run_stream_move(args: argparse.Namespace, config: HandConfig) -> None:
         hand.enable_torque(test_motor_ids)
 
         open_target = np.array(hold_position, copy=True)
-        open_target[selected_indices] = OPEN_ANGLE_RAD
+        open_target[selected_indices] = open_angles
         for trial in range(1, args.trials + 1):
             print(f"Trial {trial}/{args.trials}")
             hand.set_motion_profile(
@@ -450,11 +477,11 @@ def _run_stream_move(args: argparse.Namespace, config: HandConfig) -> None:
                 motor_ids=test_motor_ids,
             )
             hand.set_positions(open_target)
-            for motor_id in test_motor_ids:
+            for motor_id, open_angle in zip(test_motor_ids, open_angles):
                 _wait_for_motor(
                     hand,
                     motor_id,
-                    OPEN_ANGLE_RAD,
+                    float(open_angle),
                     args.preposition_timeout_s,
                     skip_target_safety=args.skip_target_safety,
                 )
@@ -472,8 +499,8 @@ def _run_stream_move(args: argparse.Namespace, config: HandConfig) -> None:
                 current_recorder.start_trial(trial)
             target = np.array(open_target, copy=True)
             start_t = time.monotonic()
-            for tick, (sample_t, angle_rad) in enumerate(zip(sample_times, samples)):
-                target[selected_indices] = angle_rad
+            for tick, (sample_t, angles_rad) in enumerate(zip(sample_times, samples)):
+                target[selected_indices] = angles_rad
                 hand.set_positions(target)
                 if current_recorder is not None:
                     current_recorder.sample(target, float(sample_t))
@@ -493,6 +520,11 @@ def _run_stream_move(args: argparse.Namespace, config: HandConfig) -> None:
 
 
 def _run_record(args: argparse.Namespace, config: HandConfig) -> None:
+    record_motor_ids = _selected_motor_ids(args, config)
+    record_indices = [
+        config.motor_ids.index(motor_id) for motor_id in record_motor_ids
+    ]
+    record_motor_id_set = set(record_motor_ids)
     output = args.output.expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     if not any(abs(offset) > 1e-9 for offset in config.home_offsets):
@@ -517,7 +549,7 @@ def _run_record(args: argparse.Namespace, config: HandConfig) -> None:
             writer = csv.writer(stream)
             writer.writerow(
                 ["elapsed_s", "unix_time_s"]
-                + [f"motor_{motor_id}_rad" for motor_id in hand.motor_ids]
+                + [f"motor_{motor_id}_rad" for motor_id in record_motor_ids]
             )
             next_sample = time.monotonic()
             while (
@@ -529,14 +561,20 @@ def _run_record(args: argparse.Namespace, config: HandConfig) -> None:
                     time.sleep(next_sample - now)
                 elapsed = time.monotonic() - start_monotonic
                 positions = hand.read_pos()
-                writer.writerow([elapsed, time.time(), *positions.tolist()])
+                writer.writerow(
+                    [elapsed, time.time()]
+                    + [float(positions[index]) for index in record_indices]
+                )
                 stream.flush()
                 sample_count += 1
                 if args.print_every and sample_count % args.print_every == 0:
-                    formatted = np.array2string(
-                        positions,
-                        precision=3,
-                        suppress_small=True,
+                    formatted = "[{}]".format(
+                        " ".join(
+                            f"{float(position):8.3f}"
+                            if motor_id in record_motor_id_set
+                            else " " * 8
+                            for motor_id, position in zip(hand.motor_ids, positions)
+                        )
                     )
                     print(f"{elapsed:8.3f}s {formatted}")
                 next_sample += sample_period
@@ -558,32 +596,35 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--motor-ids",
-        type=_parse_two_motor_ids,
+        type=_parse_fixture_motor_ids,
         default=DEFAULT_MOTOR_IDS,
-        help="Two comma-separated fixture motor IDs (default: 4,5)",
+        help=(
+            f"{len(DEFAULT_MOTOR_IDS)} comma-separated fixture motor IDs "
+            f"(default: {','.join(map(str, DEFAULT_MOTOR_IDS))})"
+        ),
     )
     commands = parser.add_subparsers(dest="command", required=True)
 
-    home = commands.add_parser("home", help="Home both configured joints")
+    home = commands.add_parser("home", help="Home all configured joints")
     home.add_argument("--current-threshold-ma", type=float, default=200.0)
     home.add_argument("--velocity-rad-s", type=float, default=1.5)
     home.add_argument("--yes", action="store_true", help="Skip the MOVE prompt")
 
     profile_move = commands.add_parser(
         "profile_move",
-        help="Move one or both fixture motors closed then open",
+        help="Move one or more fixture motors closed then open",
     )
     profile_move.add_argument(
         "--motors",
         type=_parse_motor_ids,
         default=None,
-        help="Fixture motor IDs to test (default: both)",
+        help="Fixture motor IDs to test (default: all configured motors)",
     )
     _add_profile_move_arguments(profile_move)
 
     profile_move_sequential = commands.add_parser(
         "profile_move_sequential",
-        help="Profile-move both fixture motors sequentially to verify mapping",
+        help="Profile-move all fixture motors sequentially to verify mapping",
     )
     profile_move_sequential.set_defaults(motors=None)
     _add_profile_move_arguments(profile_move_sequential)
@@ -596,7 +637,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--motors",
         type=_parse_motor_ids,
         default=None,
-        help="Fixture motor IDs to stream together (default: both)",
+        help="Fixture motor IDs to stream together (default: all configured motors)",
     )
     stream_move.add_argument(
         "--rate-hz",
@@ -614,7 +655,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--preposition-timeout-s",
         type=float,
         default=PROFILE_MOVE_TIMEOUT_S,
-        help="Timeout while moving to OPEN_ANGLE_RAD before streaming",
+        help="Timeout while moving to each joint's open angle before streaming",
     )
     stream_move.add_argument(
         "--settle-s",
@@ -633,7 +674,13 @@ def _build_parser() -> argparse.ArgumentParser:
 
     record = commands.add_parser(
         "record",
-        help="Disable torque and record both calibrated actuator angles to CSV",
+        help="Disable torque and record selected calibrated actuator angles to CSV",
+    )
+    record.add_argument(
+        "--motors",
+        type=_parse_motor_ids,
+        default=None,
+        help="Fixture motor IDs to record (default: all configured motors)",
     )
     record.add_argument(
         "--output",
