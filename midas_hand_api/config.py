@@ -354,6 +354,9 @@ class HandConfig:
         entry_ids = [entry[0] for entry in homing_entries]
         if len(set(entry_ids)) != len(entry_ids):
             raise ValueError("homing tables must contain unique motor IDs")
+        entry_names = [entry[1] for entry in homing_entries]
+        if len(set(entry_names)) != len(entry_names):
+            raise ValueError("homing tables must contain unique joint names")
         for motor_id, joint_name, cad_offset, direction in homing_entries:
             if not 0 <= motor_id <= 252:
                 raise ValueError("homing motor IDs must be in the range 0..252")

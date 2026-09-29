@@ -173,6 +173,31 @@ position is defined as zero.
 Homing merges only the newly measured offsets into an existing file, preserving
 runtime settings, model/geometry choices, and unknown forward-compatible fields.
 
+From Python, `home_hand` can home only selected joints. Indices are the motor IDs
+in `homing.thumb` or `homing.fingers`; an unknown or unavailable index is
+rejected before any motor moves. The configured `home_offsets` for every
+unselected joint are left unchanged, so those values can be hardcoded in YAML:
+
+```python
+from midas_hand_api import home_hand
+
+home_hand(hand, joints=[4, 5])
+```
+
+```yaml
+home_offsets:
+  0: 3.1692  # Preserved when Thumb IP is not selected above.
+  1: 3.1462
+  2: 1.8883
+  3: 1.8423
+  4: 0.0     # Replaced with the newly measured Index PIP offset.
+  5: 0.0     # Replaced with the newly measured Index MCP flex offset.
+  # Other unselected motor offsets are preserved too.
+```
+
+Passing `joints=None` (the default) retains the original full-hand homing
+sequence.
+
 ## Example
 
 ```python

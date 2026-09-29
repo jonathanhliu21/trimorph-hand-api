@@ -70,6 +70,85 @@ def test_xl330_without_homing_table_is_a_safe_noop() -> None:
     assert result == hand.config
 
 
+def test_home_hand_filters_selected_joints_and_preserves_other_offsets(
+    monkeypatch,
+) -> None:
+    original_offsets = tuple(float(index) for index in range(13))
+    hand = MidasHand(
+        HandConfig(home_offsets=original_offsets), autoconnect=False
+    )
+    homed_names = []
+
+    def record_entries(hand, table, label, offsets, **kwargs):
+        indices = []
+        for motor_id, joint_name, _, _ in table:
+            motor_idx = hand.motor_ids.index(motor_id)
+            offsets[motor_idx] = 100.0 + motor_id
+            indices.append(motor_idx)
+            homed_names.append(joint_name)
+        return offsets, indices
+
+    monkeypatch.setattr(homing, "_home_entries", record_entries)
+    monkeypatch.setattr(homing, "_move_homed_motors_to_zero", lambda *args: None)
+    monkeypatch.setattr(homing.time, "sleep", lambda *_: None)
+
+    result = homing.home_hand(
+        hand,
+        save=False,
+        joints=[1, 4, 11],
+    )
+
+    assert homed_names == ["Thumb MCP", "Index PIP", "Ring MCP flex"]
+    assert result.home_offsets[1] == 101.0
+    assert result.home_offsets[4] == 104.0
+    assert result.home_offsets[11] == 111.0
+    assert result.home_offsets[0] == original_offsets[0]
+    assert result.home_offsets[9] == original_offsets[9]
+
+
+def test_home_hand_validates_all_selected_joints_before_homing(monkeypatch) -> None:
+    hand = MidasHand(HandConfig(), autoconnect=False)
+    home_entries_called = False
+
+    def record_entries(*args, **kwargs):
+        nonlocal home_entries_called
+        home_entries_called = True
+
+    monkeypatch.setattr(homing, "_home_entries", record_entries)
+
+    with pytest.raises(ValueError, match="99"):
+        homing.home_hand(hand, save=False, joints=[4, 99])
+
+    assert not home_entries_called
+
+
+def test_home_hand_none_keeps_full_homing_sequence(monkeypatch) -> None:
+    hand = MidasHand(HandConfig(), autoconnect=False)
+    homed_names = []
+
+    def record_entries(hand, table, label, offsets, **kwargs):
+        homed_names.extend(entry[1] for entry in table)
+        return offsets, []
+
+    monkeypatch.setattr(homing, "_home_entries", record_entries)
+    monkeypatch.setattr(
+        homing,
+        "_finish_homing",
+        lambda hand, *args, **kwargs: hand.config,
+    )
+    monkeypatch.setattr(
+        homing, "_set_middle_mcp_flex_for_abduction", lambda *args: None
+    )
+
+    homing.home_hand(hand, save=False, joints=None)
+
+    expected_names = [
+        entry[1]
+        for entry in hand.config.thumb_homing_table + hand.config.finger_homing_table
+    ]
+    assert homed_names == expected_names
+
+
 def test_restore_position_mode_uses_xl330_configured_tuning() -> None:
     config = HandConfig.xl330_m077(
         motor_ids=(0,),
@@ -103,4 +182,11 @@ def test_homing_configuration_validates_table_size_and_direction() -> None:
     with pytest.raises(ValueError, match="direction"):
         HandConfig.xl330_m077(
             thumb_homing_table=tuple(invalid_direction)
+        ).validate()
+
+    duplicate_name = list(HandConfig().thumb_homing_table)
+    duplicate_name[1] = (1, "Thumb IP", 0.0, -1)
+    with pytest.raises(ValueError, match="unique joint names"):
+        HandConfig.xl330_m077(
+            thumb_homing_table=tuple(duplicate_name)
         ).validate()
