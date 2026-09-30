@@ -11,6 +11,7 @@ import numpy as np
 import yaml  # pyyaml
 
 from .actuators import control_table as ct
+from .actuators.models import XL330_M077, XM335_T323, DynamixelModelSpec, get_model_spec
 
 
 DEFAULT_MOTOR_IDS = tuple(range(0, 13))
@@ -34,6 +35,24 @@ _MOTOR_VALUE_FIELDS = (
     "joint_signs",
     "joint_lower_limits",
     "joint_upper_limits",
+)
+HomingEntry = Tuple[int, str, float, int]
+DEFAULT_THUMB_HOMING_TABLE: Tuple[HomingEntry, ...] = (
+    (0, "Thumb IP", 1.61221381, -1),
+    (1, "Thumb MCP", 1.4450099, -1),
+    (2, "Thumb CMC side", -0.88510692, 1),
+    (3, "Thumb CMC roll", 0.0, -1),
+)
+DEFAULT_FINGER_HOMING_TABLE: Tuple[HomingEntry, ...] = (
+    (4, "Index PIP", -0.03, 1),
+    (5, "Index MCP flex", -0.05, 1),
+    (6, "Index MCP abduct", 0.81, -1),
+    (7, "Middle PIP", -0.03, 1),
+    (8, "Middle MCP flex", -0.05, 1),
+    (9, "Middle MCP abduct", 0.8, -1),
+    (10, "Ring PIP", -0.03, 1),
+    (11, "Ring MCP flex", -0.05, 1),
+    (12, "Ring MCP abduct", -0.81, 1),
 )
 
 
@@ -86,17 +105,20 @@ def _motor_value_map(
     return {int(motor_id): float(value) for motor_id, value in zip(motor_ids, values)}
 
 
-def _lookup_motor_value(
-    values: Mapping[Union[int, str], float],
-    motor_id: int,
-    name: str,
-) -> float:
-    if motor_id in values:
-        return float(values[motor_id])
-    key = str(motor_id)
-    if key in values:
-        return float(values[key])
-    raise ValueError(f"{name} is missing value for motor ID {motor_id}")
+def _coerce_homing_table(
+    values: Sequence[Sequence[object]], name: str
+) -> Tuple[HomingEntry, ...]:
+    entries = []
+    for value in values:
+        if len(value) != 4:
+            raise ValueError(
+                f"each {name} entry must be [motor_id, joint_name, cad_offset_rad, direction]"
+            )
+        motor_id, joint_name, cad_offset_rad, direction = value
+        entries.append(
+            (int(motor_id), str(joint_name), float(cad_offset_rad), int(direction))
+        )
+    return tuple(entries)
 
 
 def _filtered_passive_topology(
@@ -132,12 +154,9 @@ def _filtered_passive_topology(
 
 @dataclass(frozen=True)
 class HandConfig:
-    """Runtime configuration for the Midas Dynamixel hand.
+    """Runtime and mechanical configuration for a supported hand."""
 
-    Actuator model constants are fixed for the XM335-T323-T motors used by this
-    hand. This object keeps runtime connection settings and hand calibration.
-    """
-
+    motor_model: str = XM335_T323.name
     motor_ids: Tuple[int, ...] = DEFAULT_MOTOR_IDS
     port: Optional[str] = None
     baudrate: int = DEFAULT_DYNAMIXEL_BAUDRATE
@@ -168,8 +187,14 @@ class HandConfig:
     joint_upper_limits: Sequence[float] = field(
         default_factory=lambda: _repeat(pi, len(DEFAULT_MOTOR_IDS))
     )
+    pip_dip_lookup: Optional[str] = None
+    thumb_homing_table: Tuple[HomingEntry, ...] = DEFAULT_THUMB_HOMING_TABLE
+    finger_homing_table: Tuple[HomingEntry, ...] = DEFAULT_FINGER_HOMING_TABLE
+    middle_mcp_flex_pre_abduct_position_rad: float = -0.5 * pi
 
     def __post_init__(self) -> None:
+        spec = get_model_spec(self.motor_model)
+        object.__setattr__(self, "motor_model", spec.name)
         motor_ids = tuple(int(motor_id) for motor_id in self.motor_ids)
         object.__setattr__(self, "motor_ids", motor_ids)
         if (
@@ -195,6 +220,34 @@ class HandConfig:
                 name,
                 _coerce_motor_values(getattr(self, name), motor_ids, name),
             )
+        object.__setattr__(
+            self,
+            "thumb_homing_table",
+            _coerce_homing_table(self.thumb_homing_table, "thumb_homing_table"),
+        )
+        object.__setattr__(
+            self,
+            "finger_homing_table",
+            _coerce_homing_table(self.finger_homing_table, "finger_homing_table"),
+        )
+        if self.pip_dip_lookup is not None:
+            object.__setattr__(
+                self,
+                "pip_dip_lookup",
+                str(pathlib.Path(self.pip_dip_lookup).expanduser()),
+            )
+
+    @property
+    def _model_spec(self) -> DynamixelModelSpec:
+        return get_model_spec(self.motor_model)
+
+    @property
+    def expected_model_number(self) -> int:
+        return self._model_spec.model_number
+
+    @property
+    def max_current_limit_ma(self) -> int:
+        return self._model_spec.max_current_limit_ma
 
     @property
     def n_motors(self) -> int:
@@ -210,19 +263,19 @@ class HandConfig:
     def position_scale(self) -> float:
         """Radians per encoder count."""
 
-        return ct.XM335_T323_POSITION_UNIT_RAD
+        return ct.X_SERIES_POSITION_UNIT_RAD
 
     @property
     def velocity_scale(self) -> float:
         """Radians/sec per raw velocity unit."""
 
-        return ct.XM335_T323_VELOCITY_UNIT_RAD_S
+        return ct.X_SERIES_VELOCITY_UNIT_RAD_S
 
     @property
     def current_unit_ma(self) -> float:
         """mA per raw current unit."""
 
-        return ct.XM335_T323_CURRENT_UNIT_MA
+        return ct.X_SERIES_CURRENT_UNIT_MA
 
     @property
     def home_offsets_array(self) -> np.ndarray:
@@ -242,30 +295,79 @@ class HandConfig:
 
     def validate(self) -> None:
         n = len(self.motor_ids)
-        motor_fields = {
-            name: getattr(self, name)
-            for name in _MOTOR_VALUE_FIELDS
-        }
-        for name, values in motor_fields.items():
+        if n == 0:
+            raise ValueError("motor_ids must not be empty")
+        if len(set(self.motor_ids)) != n:
+            raise ValueError("motor_ids must be unique")
+        if any(motor_id < 0 or motor_id > 252 for motor_id in self.motor_ids):
+            raise ValueError("motor_ids must be in the range 0..252")
+        if self.baudrate <= 0:
+            raise ValueError("baudrate must be greater than zero")
+        for name in _MOTOR_VALUE_FIELDS:
+            values = getattr(self, name)
             if len(values) != n:
                 raise ValueError(
                     f"{name} must have {n} values (one per motor), got {len(values)}"
                 )
+            if not np.isfinite(np.asarray(values, dtype=np.float64)).all():
+                raise ValueError(f"{name} must contain only finite values")
+        if not np.all(np.isin(self.joint_signs_array, (-1.0, 1.0))):
+            raise ValueError("joint_signs values must be -1 or 1")
+        if np.any(self.joint_lower_limits_array >= self.joint_upper_limits_array):
+            raise ValueError("each joint lower limit must be below its upper limit")
+
+        spec = self._model_spec
+        if self.operating_mode not in ct.X_SERIES_SUPPORTED_OPERATING_MODES:
+            raise ValueError(
+                f"operating_mode {self.operating_mode} is unsupported by {spec.name}"
+            )
+        for name in ("position_p_gain", "position_i_gain", "position_d_gain"):
+            value = getattr(self, name)
+            if value != int(value) or not 0 <= value <= ct.X_SERIES_MAX_GAIN:
+                raise ValueError(
+                    f"{name} must be an integer in 0..{ct.X_SERIES_MAX_GAIN}"
+                )
+        if not 0 <= self.goal_current_limit <= spec.max_current_limit_ma:
+            raise ValueError(
+                "goal_current_limit must be between 0 and "
+                f"{spec.max_current_limit_ma} mA for {spec.name}"
+            )
+
         if len(self.passive_joint_indices) != len(self.pip_motor_indices):
             raise ValueError(
                 "passive_joint_indices and pip_motor_indices must have the same length"
             )
         for idx in self.pip_motor_indices:
-            if idx >= n:
+            if idx < 0 or idx >= n:
                 raise ValueError(
                     "pip_motor_indices contains "
                     f"{idx}, but only {n} motors are configured"
                 )
-        if self.goal_current_limit > ct.XM335_T323_MAX_CURRENT_LIMIT:
-            raise ValueError(
-                "goal_current_limit must be <= "
-                f"{ct.XM335_T323_MAX_CURRENT_LIMIT} for XM335-T323-T"
-            )
+        if any(idx < 0 or idx >= self.n_dof for idx in self.passive_joint_indices):
+            raise ValueError("passive_joint_indices contains an invalid DOF index")
+
+        homing_entries = self.thumb_homing_table + self.finger_homing_table
+        if len(self.thumb_homing_table) not in (0, 4):
+            raise ValueError("homing.thumb must contain 4 entries or be empty")
+        if len(self.finger_homing_table) not in (0, 9):
+            raise ValueError("homing.fingers must contain 9 entries or be empty")
+        entry_ids = [entry[0] for entry in homing_entries]
+        if len(set(entry_ids)) != len(entry_ids):
+            raise ValueError("homing tables must contain unique motor IDs")
+        entry_names = [entry[1] for entry in homing_entries]
+        if len(set(entry_names)) != len(entry_names):
+            raise ValueError("homing tables must contain unique joint names")
+        for motor_id, joint_name, cad_offset, direction in homing_entries:
+            if not 0 <= motor_id <= 252:
+                raise ValueError("homing motor IDs must be in the range 0..252")
+            if direction not in (-1, 1):
+                raise ValueError("homing direction must be -1 or 1")
+            if not joint_name or not np.isfinite(cad_offset):
+                raise ValueError("homing names must be non-empty and offsets finite")
+        if not np.isfinite(self.middle_mcp_flex_pre_abduct_position_rad):
+            raise ValueError("middle MCP flex pre-abduction position must be finite")
+        if self.pip_dip_lookup is not None and not pathlib.Path(self.pip_dip_lookup).exists():
+            raise ValueError(f"pip_dip_lookup does not exist: {self.pip_dip_lookup}")
 
     @classmethod
     def xm335_t323(
@@ -287,9 +389,37 @@ class HandConfig:
         ):
             overrides.pop(key, None)
         values = {
+            "motor_model": XM335_T323.name,
             "motor_ids": motor_ids,
             "port": port,
             "baudrate": baudrate,
+        }
+        values.update(overrides)
+        return cls(**values)
+
+    @classmethod
+    def xl330_m077(
+        cls,
+        motor_ids: Tuple[int, ...] = DEFAULT_MOTOR_IDS,
+        port: Optional[str] = None,
+        baudrate: int = XL330_M077.factory_baudrate,
+        **overrides,
+    ) -> "HandConfig":
+        """Construct an XL330 config with conservative, explicit tuning defaults."""
+
+        overrides.pop("motor_model", None)
+        values = {
+            "motor_model": XL330_M077.name,
+            "motor_ids": motor_ids,
+            "port": port,
+            "baudrate": baudrate,
+            "position_p_gain": 400,
+            "position_i_gain": 0,
+            "position_d_gain": 400,
+            "goal_current_limit": 300,
+            # Hard-stop directions and CAD offsets are hand-specific.
+            "thumb_homing_table": (),
+            "finger_homing_table": (),
         }
         values.update(overrides)
         return cls(**values)
@@ -328,16 +458,21 @@ class HandConfig:
         )
 
     def save(self, path: Union[str, pathlib.Path] = DEFAULT_CONFIG_PATH) -> None:
-        """Save hand calibration to YAML (default: ``~/.midas_hand/config.yaml``).
-
-        The YAML intentionally stores only hand-specific calibration values.
-        Controller gains, current limits, model constants, and baudrate live in
-        code defaults and can be overridden explicitly at runtime.
-        """
+        """Save runtime, mechanical, and calibration configuration to YAML."""
         path = pathlib.Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         data = {
+            "motor_model": self.motor_model,
             "motor_ids": list(self.motor_ids),
+            "port": self.port,
+            "baudrate": self.baudrate,
+            "operating_mode": self.operating_mode,
+            "position_p_gain": self.position_p_gain,
+            "position_i_gain": self.position_i_gain,
+            "position_d_gain": self.position_d_gain,
+            "goal_current_limit_ma": self.goal_current_limit,
+            "passive_joint_indices": list(self.passive_joint_indices),
+            "pip_motor_indices": list(self.pip_motor_indices),
             "home_offsets": _motor_value_map(self.motor_ids, self.home_offsets),
             "joint_signs": _motor_value_map(self.motor_ids, self.joint_signs),
             "joint_lower_limits": _motor_value_map(
@@ -346,36 +481,54 @@ class HandConfig:
             "joint_upper_limits": _motor_value_map(
                 self.motor_ids, self.joint_upper_limits
             ),
+            "pip_dip_lookup": self.pip_dip_lookup,
+            "homing": {
+                "thumb": [list(entry) for entry in self.thumb_homing_table],
+                "fingers": [list(entry) for entry in self.finger_homing_table],
+                "middle_mcp_flex_pre_abduct_position_rad": (
+                    self.middle_mcp_flex_pre_abduct_position_rad
+                ),
+            },
         }
         with open(path, "w") as f:
-            yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+            yaml.safe_dump(data, f, default_flow_style=False, sort_keys=False)
 
     def save_merged_offsets(
         self,
         motor_indices: Sequence[int],
         path: Union[str, pathlib.Path] = DEFAULT_CONFIG_PATH,
     ) -> None:
-        """Merge selected home offsets into the saved calibration YAML.
-
-        Homing may be run on only part of the hand. This method preserves
-        existing calibration entries for other motors, updates/replaces only
-        the successfully homed motor IDs, and drops stale runtime tuning fields.
-        """
+        """Merge selected offsets without discarding any unrelated YAML fields."""
 
         path = pathlib.Path(path)
         if path.exists():
             with open(path) as f:
                 data = yaml.safe_load(f) or {}
         else:
-            data = {}
+            self.save(path)
+            with open(path) as f:
+                data = yaml.safe_load(f) or {}
 
-        saved_motor_ids = [int(motor_id) for motor_id in data.get("motor_ids", [])]
+        if not isinstance(data, dict):
+            raise ValueError("configuration YAML root must be a mapping")
+        saved_ids_value = data.get("motor_ids")
+        if saved_ids_value is None:
+            offset_value = data.get("home_offsets")
+            if isinstance(offset_value, Mapping):
+                saved_ids_value = list(offset_value)
+            elif isinstance(offset_value, list):
+                saved_ids_value = DEFAULT_MOTOR_IDS[: len(offset_value)]
+            else:
+                saved_ids_value = ()
+        saved_motor_ids = [int(motor_id) for motor_id in saved_ids_value]
         existing_ids = list(saved_motor_ids)
         for motor_id in self.motor_ids:
             if int(motor_id) not in existing_ids:
                 existing_ids.append(int(motor_id))
 
-        merged_data = {"motor_ids": existing_ids}
+        merged_data = dict(data)
+        merged_data.setdefault("motor_model", self.motor_model)
+        merged_data["motor_ids"] = existing_ids
 
         for key in _MOTOR_VALUE_FIELDS:
             values = getattr(self, key)
@@ -385,10 +538,14 @@ class HandConfig:
                     int(motor_id): float(value)
                     for motor_id, value in zip(saved_motor_ids, existing)
                 }
+            elif np.isscalar(existing) and existing is not None:
+                existing = {
+                    int(motor_id): float(existing) for motor_id in saved_motor_ids
+                }
             else:
                 existing = {
                     int(motor_id): float(value)
-                    for motor_id, value in existing.items()
+                    for motor_id, value in (existing or {}).items()
                 }
 
             if key == "home_offsets":
@@ -402,31 +559,62 @@ class HandConfig:
 
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w") as f:
-            yaml.dump(merged_data, f, default_flow_style=False, sort_keys=False)
+            yaml.safe_dump(merged_data, f, default_flow_style=False, sort_keys=False)
 
     @classmethod
     def load(cls, path: Union[str, pathlib.Path] = DEFAULT_CONFIG_PATH) -> "HandConfig":
-        """Load calibration from YAML over the code defaults.
-
-        Runtime fields that may exist in older YAML files, such as gains,
-        current limits, port, baudrate, and model constants, are ignored.
-        """
+        """Load YAML as an overlay on the selected motor-model defaults."""
+        path = pathlib.Path(path)
         with open(path) as f:
             data = yaml.safe_load(f) or {}
+        if not isinstance(data, dict):
+            raise ValueError("configuration YAML root must be a mapping")
+
+        model = get_model_spec(data.get("motor_model", XM335_T323.name))
         motor_ids = tuple(
             int(motor_id) for motor_id in data.get("motor_ids", DEFAULT_MOTOR_IDS)
         )
-        config = cls(motor_ids=motor_ids)
-        updates = {}
-        for key in _MOTOR_VALUE_FIELDS:
+        factory = cls.xl330_m077 if model is XL330_M077 else cls.xm335_t323
+        config = factory(motor_ids=motor_ids)
+        updates = {"motor_model": model.name}
+        direct_fields = (
+            "port",
+            "baudrate",
+            "passive_joint_indices",
+            "pip_motor_indices",
+            "position_p_gain",
+            "position_i_gain",
+            "position_d_gain",
+            "operating_mode",
+        ) + _MOTOR_VALUE_FIELDS
+        for key in direct_fields:
             if key in data:
-                val = data[key]
-                if isinstance(val, dict):
-                    updates[key] = tuple(
-                        _lookup_motor_value(val, int(mid), key) for mid in motor_ids
-                    )
-                elif isinstance(val, list):
-                    updates[key] = tuple(float(value) for value in val)
-        if updates:
-            config = replace(config, **updates)
+                value = data[key]
+                if key in ("passive_joint_indices", "pip_motor_indices"):
+                    value = tuple(int(item) for item in value)
+                updates[key] = value
+        if "goal_current_limit_ma" in data:
+            updates["goal_current_limit"] = data["goal_current_limit_ma"]
+        elif "goal_current_limit" in data:
+            updates["goal_current_limit"] = data["goal_current_limit"]
+        homing = data.get("homing")
+        if homing is not None:
+            if not isinstance(homing, Mapping):
+                raise ValueError("homing must be a mapping")
+            if "thumb" in homing:
+                updates["thumb_homing_table"] = homing["thumb"]
+            if "fingers" in homing:
+                updates["finger_homing_table"] = homing["fingers"]
+            if "middle_mcp_flex_pre_abduct_position_rad" in homing:
+                updates["middle_mcp_flex_pre_abduct_position_rad"] = float(
+                    homing["middle_mcp_flex_pre_abduct_position_rad"]
+                )
+        if data.get("pip_dip_lookup") is not None:
+            lookup = pathlib.Path(str(data["pip_dip_lookup"])).expanduser()
+            if not lookup.is_absolute():
+                lookup = path.parent / lookup
+            updates["pip_dip_lookup"] = str(lookup.resolve())
+
+        config = replace(config, **updates)
+        config.validate()
         return config

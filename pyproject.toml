@@ -9,16 +9,22 @@ description = "Python API for the Midas robotic hand"
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
-    "dynamixel-sdk>=4.0.3",
+    "dynamixel-sdk==4.0.3",
     "numpy>=2.0",
     "pyserial>=3.5",
     "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]
+graph = [
+    "matplotlib>=3.8",
+]
 qt = [
     "pyqtgraph>=0.13.7",
     "PyQt6>=6.6",
+]
+test = [
+    "pytest>=8",
 ]
 
 [project.scripts]

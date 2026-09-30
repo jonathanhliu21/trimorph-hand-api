@@ -9,41 +9,12 @@ from typing import Optional, Sequence, Tuple
 import numpy as np
 
 from .actuators import control_table as ct
-from .config import DEFAULT_CONFIG_PATH, HandConfig
+from .config import DEFAULT_CONFIG_PATH, HandConfig, HomingEntry
 from .hand import MidasHand, _profile_acceleration_rad_s2_to_raw
 
 
-# (motor_id, joint_name, cad_offset_rad, homing_direction)
-# cad_offset_rad: added to hard-stop raw position to get software zero
-# homing_direction: +1 = positive encoder direction toward hard stop, -1 = negative
-THUMB_HOMING_TABLE = [
-    (0, "Thumb IP", 1.61221381, -1),
-    (1, "Thumb MCP", 1.4450099, -1),
-    (2, "Thumb CMC side", -0.88510692, +1),
-    (3, "Thumb CMC roll", 0.0, -1),
-]
-
-FINGER_HOMING_TABLE = [
-    (4, "Index PIP", -0.03, +1),
-    (5, "Index MCP flex", -0.05, +1),
-    (6, "Index MCP abduct", 0.81, -1),
-    (7, "Middle PIP", -0.03, +1),
-    (8, "Middle MCP flex", -0.05, +1),
-    (9, "Middle MCP abduct", 0.8, -1),
-    (10, "Ring PIP", -0.03, +1),
-    (11, "Ring MCP flex", -0.05, +1),
-    (12, "Ring MCP abduct", -0.81, +1),
-]
-
-INDEX_FINGER_HOMING_TABLE = FINGER_HOMING_TABLE[0:3]
-MIDDLE_FINGER_PRE_ABDUCT_HOMING_TABLE = FINGER_HOMING_TABLE[3:5]
-MIDDLE_FINGER_ABDUCT_HOMING_TABLE = FINGER_HOMING_TABLE[5:6]
-RING_FINGER_HOMING_TABLE = FINGER_HOMING_TABLE[6:9]
 MIDDLE_MCP_FLEX_MOTOR_ID = 8
 MIDDLE_MCP_ABDUCT_MOTOR_ID = 9
-MIDDLE_MCP_FLEX_PRE_ABDUCT_POSITION_RAD = -0.5 * np.pi
-
-HomingEntry = Tuple[int, str, float, int]
 
 
 def home_motor(
@@ -179,11 +150,9 @@ def _restore_position_mode(hand: MidasHand, motor_id: int) -> None:
         ct.ADDR_POSITION_D_GAIN,
         ct.LEN_GAIN,
     )
-    client.sync_write(
+    hand.set_current_limit(
+        hand.config.goal_current_limit,
         [motor_id],
-        [hand.config.goal_current_limit],
-        ct.ADDR_GOAL_CURRENT,
-        ct.LEN_GOAL_CURRENT,
     )
     client.sync_write(
         [motor_id], [0], ct.ADDR_PROFILE_ACCELERATION, ct.LEN_PROFILE_ACCELERATION
@@ -214,7 +183,7 @@ def home_thumb(
     """
     return _home_table(
         hand,
-        THUMB_HOMING_TABLE,
+        hand.config.thumb_homing_table,
         "thumb",
         save=save,
         check_connected=True,
@@ -234,12 +203,23 @@ def home_fingers(
 def home_hand(
     hand: MidasHand,
     save: bool = True,
+    joints: Optional[Sequence[int]] = None,
     **kwargs,
 ) -> HandConfig:
-    """Home thumb plus index, middle, and ring finger motors."""
+    """Home selected joints, or the entire hand when ``joints`` is ``None``.
+
+    Joint indices are the motor IDs from the configured homing tables. All
+    requested indices are validated before any motors move. Offsets for joints
+    that are not selected are preserved in ``hand.config.home_offsets`` and on
+    disk.
+    """
+    selected_joint_indices = _validate_homing_joint_selection(hand, joints)
+    thumb_table = _filter_homing_table(
+        hand.config.thumb_homing_table, selected_joint_indices
+    )
     offsets = list(hand.config.home_offsets)
     offsets, homed_motor_indices = _home_entries(
-        hand, THUMB_HOMING_TABLE, "thumb", offsets, **kwargs
+        hand, thumb_table, "thumb", offsets, **kwargs
     )
     return _home_finger_sequence(
         hand,
@@ -247,8 +227,47 @@ def home_hand(
         save=save,
         initial_offsets=offsets,
         initial_homed_motor_indices=homed_motor_indices,
+        selected_joint_indices=selected_joint_indices,
         **kwargs,
     )
+
+
+def _validate_homing_joint_selection(
+    hand: MidasHand,
+    joints: Optional[Sequence[int]],
+) -> Optional[frozenset[int]]:
+    if joints is None:
+        return None
+    if isinstance(joints, (str, bytes)):
+        raise TypeError("joints must be a sequence of integer joint indices")
+
+    requested = tuple(joints)
+    if any(not isinstance(joint, int) or isinstance(joint, bool) for joint in requested):
+        raise TypeError("joints must be a sequence of integer joint indices")
+    configured_entries = (
+        hand.config.thumb_homing_table + hand.config.finger_homing_table
+    )
+    available = {
+        motor_id
+        for motor_id, _, _, _ in configured_entries
+        if motor_id in hand.motor_ids
+    }
+    unknown = sorted(set(requested) - available)
+    if unknown:
+        raise ValueError(
+            f"Unknown or unavailable homing joint indices: {unknown}. "
+            f"Available joint indices: {sorted(available)}"
+        )
+    return frozenset(requested)
+
+
+def _filter_homing_table(
+    table: Sequence[HomingEntry],
+    selected_joint_indices: Optional[frozenset[int]],
+) -> Sequence[HomingEntry]:
+    if selected_joint_indices is None:
+        return table
+    return tuple(entry for entry in table if entry[0] in selected_joint_indices)
 
 
 def _home_finger_sequence(
@@ -257,31 +276,41 @@ def _home_finger_sequence(
     save: bool = True,
     initial_offsets: Optional[Sequence[float]] = None,
     initial_homed_motor_indices: Optional[Sequence[int]] = None,
+    selected_joint_indices: Optional[frozenset[int]] = None,
     **kwargs,
 ) -> HandConfig:
     offsets = list(initial_offsets or hand.config.home_offsets)
     homed_motor_indices = list(initial_homed_motor_indices or [])
+    finger_table = hand.config.finger_homing_table
 
     for table, table_label in (
-        (INDEX_FINGER_HOMING_TABLE, "index finger"),
-        (MIDDLE_FINGER_PRE_ABDUCT_HOMING_TABLE, "middle finger"),
+        (finger_table[0:3], "index finger"),
+        (finger_table[3:5], "middle finger"),
     ):
-        offsets, new_indices = _home_entries(hand, table, table_label, offsets, **kwargs)
+        table = _filter_homing_table(table, selected_joint_indices)
+        offsets, new_indices = _home_entries(
+            hand, table, table_label, offsets, **kwargs
+        )
         homed_motor_indices.extend(new_indices)
 
-    _set_middle_mcp_flex_for_abduction(hand, offsets)
+    middle_abduction_table = _filter_homing_table(
+        finger_table[5:6], selected_joint_indices
+    )
+    if middle_abduction_table:
+        _set_middle_mcp_flex_for_abduction(hand, offsets)
 
     offsets, new_indices = _home_entries(
         hand,
-        MIDDLE_FINGER_ABDUCT_HOMING_TABLE,
+        middle_abduction_table,
         "middle finger abduction",
         offsets,
         **kwargs,
     )
     homed_motor_indices.extend(new_indices)
 
+    ring_table = _filter_homing_table(finger_table[6:9], selected_joint_indices)
     offsets, new_indices = _home_entries(
-        hand, RING_FINGER_HOMING_TABLE, "ring finger", offsets, **kwargs
+        hand, ring_table, "ring finger", offsets, **kwargs
     )
     homed_motor_indices.extend(new_indices)
 
@@ -324,6 +353,8 @@ def _home_entries(
     **kwargs,
 ) -> Tuple[list[float], list[int]]:
     homed_motor_indices = []
+    if not table:
+        return offsets, homed_motor_indices
     table_motor_ids = [entry[0] for entry in table]
     configured_table_ids = [motor_id for motor_id in table_motor_ids if motor_id in hand.motor_ids]
     connected_ids = set(table_motor_ids)
@@ -424,11 +455,12 @@ def _set_middle_mcp_flex_for_abduction(
         return
 
     motor_idx = hand.motor_ids.index(MIDDLE_MCP_FLEX_MOTOR_ID)
-    print("Moving Middle MCP flex to -90 deg before Middle MCP abduct homing...")
+    target = hand.config.middle_mcp_flex_pre_abduct_position_rad
+    print(f"Moving Middle MCP flex to {target:.3f} rad before abduction homing...")
     _set_single_motor_position_and_wait(
         hand,
         motor_idx,
-        MIDDLE_MCP_FLEX_PRE_ABDUCT_POSITION_RAD,
+        target,
         home_offsets=home_offsets,
         tolerance_rad=0.035,
         velocity_threshold_rad_s=0.05,

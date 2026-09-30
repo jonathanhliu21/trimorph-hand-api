@@ -1,6 +1,7 @@
 # Midas Hand API
 
-Python API for the Midas 13-motor Dynamixel hand (`XM335-T323-T` actuators)
+Python API for 13-motor Dynamixel hands using `XM335-T323-T` or
+`XL330-M077-T` actuators
 with Paxini tactile support. Provides a low-level Dynamixel client, a high-level
 hand object, motor homing/calibration utilities, and local Qt tactile tools.
 
@@ -18,6 +19,8 @@ midas_hand_api/
 python3 -m venv .venv
 source .venv/bin/activate
 pip install .          # or pip install -e . for a dev/editable install
+pip install -e '.[test]'  # editable install with pytest
+.venv/bin/python -m pytest
 ```
 
 Give your user serial-port access:
@@ -56,10 +59,60 @@ python examples/smoke_test.py
 python -m midas_hand_api --help  # see options for motor scan, live position read, homing, configure, tactile recalibration, etc.
 ```
 
-By default, the smoke test uses motor IDs `0` through `12`. If you only want to
-test a subset, pass `--motors`, for example `--motors 0,1,2,3`. Do not leave
-Dynamixel Wizard open while running the API because it keeps the serial port
-busy.
+The hardware test uses motor IDs `0` through `12` by default; use `--motors 0`
+to select one actuator. Do not leave Dynamixel Wizard open while running the API
+because it keeps the serial port busy.
+
+## Motor model configuration
+
+`DynamixelClient`, register addresses, and conversion units are shared between
+both motor models. A small immutable descriptor contains only the values that
+differ at runtime: model number, factory baud rate, and current ceiling. A
+legacy calibration-only YAML file still loads as XM335. XL330 YAML must
+either use the conservative `HandConfig.xl330_m077()` tuning defaults shown
+below or override them in YAML.
+
+```yaml
+motor_model: xl330-m077-t
+motor_ids: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+port: /dev/serial/by-id/your-adapter
+baudrate: 57600
+operating_mode: 5
+position_p_gain: 400
+position_i_gain: 0
+position_d_gain: 400
+goal_current_limit_ma: 300
+joint_signs: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+joint_lower_limits: [-3.14, -3.14, -3.14, -3.14, -3.14, -3.14, -3.14, -3.14, -3.14, -3.14, -3.14, -3.14, -3.14]
+joint_upper_limits: [3.14, 3.14, 3.14, 3.14, 3.14, 3.14, 3.14, 3.14, 3.14, 3.14, 3.14, 3.14, 3.14]
+pip_dip_lookup: geometry/pip_dip_lookup.csv
+homing:
+  # [motor ID, label, CAD offset in radians, hard-stop direction]
+  thumb:
+    - [0, Thumb IP, 1.61, -1]
+    - [1, Thumb MCP, 1.45, -1]
+    - [2, Thumb CMC side, -0.89, 1]
+    - [3, Thumb CMC roll, 0.0, -1]
+  fingers:
+    - [4, Index PIP, -0.03, 1]
+    - [5, Index MCP flex, -0.05, 1]
+    - [6, Index MCP abduct, 0.81, -1]
+    - [7, Middle PIP, -0.03, 1]
+    - [8, Middle MCP flex, -0.05, 1]
+    - [9, Middle MCP abduct, 0.80, -1]
+    - [10, Ring PIP, -0.03, 1]
+    - [11, Ring MCP flex, -0.05, 1]
+    - [12, Ring MCP abduct, -0.81, 1]
+  middle_mcp_flex_pre_abduct_position_rad: -1.57
+```
+
+Calibration and joint-limit values may be ordered lists or maps keyed by motor
+ID. Gains and current remain single values for the whole hand, matching the
+original API. Relative `pip_dip_lookup` paths are resolved against the YAML
+file's directory. XL330s must already be provisioned at the configured baud
+rate; fresh units default to 57,600 bps. XL330 defaults leave both homing tables
+empty, so the new hand cannot enter hard-stop homing until its tables are
+explicitly supplied.
 
 ## First-Time Homing
 
@@ -93,8 +146,8 @@ zero changes, or whenever you switch to a new host computer. You do not need to
 home on every program start if the hand and host have not changed; load the saved
 config instead.
 
-Saved calibration files store only hand-specific calibration fields keyed by
-motor ID:
+Saved configuration files include runtime, mechanical, homing, and calibration
+settings. Calibration fields are keyed by motor ID:
 
 ```yaml
 motor_ids:
@@ -117,9 +170,33 @@ At runtime, these maps are converted into arrays ordered to match `motor_ids`.
 `home_offsets` are raw actuator positions, in radians, where the software joint
 position is defined as zero.
 
-Controller gains, current limits, operating mode, baudrate, and XM335-T323-T
-unit constants are code defaults in `HandConfig`. They are not persisted by
-homing, so tuning changes in code are not hidden by stale YAML values.
+Homing merges only the newly measured offsets into an existing file, preserving
+runtime settings, model/geometry choices, and unknown forward-compatible fields.
+
+From Python, `home_hand` can home only selected joints. Indices are the motor IDs
+in `homing.thumb` or `homing.fingers`; an unknown or unavailable index is
+rejected before any motor moves. The configured `home_offsets` for every
+unselected joint are left unchanged, so those values can be hardcoded in YAML:
+
+```python
+from midas_hand_api import home_hand
+
+home_hand(hand, joints=[4, 5])
+```
+
+```yaml
+home_offsets:
+  0: 3.1692  # Preserved when Thumb IP is not selected above.
+  1: 3.1462
+  2: 1.8883
+  3: 1.8423
+  4: 0.0     # Replaced with the newly measured Index PIP offset.
+  5: 0.0     # Replaced with the newly measured Index MCP flex offset.
+  # Other unselected motor offsets are preserved too.
+```
+
+Passing `joints=None` (the default) retains the original full-hand homing
+sequence.
 
 ## Example
 

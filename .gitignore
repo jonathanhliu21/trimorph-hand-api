@@ -8,3 +8,4 @@ build/
 *.pyc
 .eggs/
 *.csv
+output/
