@@ -8,12 +8,10 @@ same.
 
 ## Hardware Layout
 
-| Finger | Force points | Board device address |
-|--------|--------------|----------------------|
-| thumb | 127 | 1 |
-| index | 52 | 2 |
-| middle | 52 | 3 |
-| ring | 52 | 4 |
+The driver discovers the active module slots and distributed-force point counts
+from board registers `0x0010`–`0x0013` and `0x0030`–`0x0067` before starting
+auto-push. The expected Midas configuration is one 127-point thumb sensor and
+three 52-point fingertip sensors, ordered thumb, index, middle, ring.
 
 The Paxini board connects over USB serial at `921600` baud. On this setup it
 usually appears as `/dev/ttyACM0`, but `PaxiniConfig(port=None)` auto-detects
@@ -78,6 +76,7 @@ config = PaxiniConfig(port=None, fingers=["index", "middle"])
 | `median_window` | `3` | Rolling median window; set `1` to disable. |
 | `scale_n` | `0.1` | Force scale in Newtons per LSB. |
 | `signed_z` | `False` | Keep Fz unsigned, matching the Paxini protocol document. |
+| `max_consecutive_error_frames` | `30` | Drop isolated nonzero auto-push error frames; stop after this many consecutive board errors. |
 
 ## Current Qt Tool
 

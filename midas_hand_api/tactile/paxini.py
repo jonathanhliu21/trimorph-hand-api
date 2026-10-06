@@ -55,6 +55,13 @@ _RECALIBRATE = bytes.fromhex("55AA00170200010001E6")
 _ADDR_DATA_TYPE = 0x0016
 _DATA_TYPE_RESULTANT_AND_DISTRIBUTED = 0x03
 
+# Auto-push payload-shape registers. The board does not put module identifiers
+# or taxel counts in every AA56 frame; those values must be read before the
+# stream starts and then used to decode the packed payload.
+_ADDR_ACTIVE_MODULES = 0x0010
+_ADDR_DISTRIBUTION_POINT_COUNTS = 0x0030
+_MODULE_COUNT = 28
+
 # 1 LSB = 0.1 N per Paxini GEN3 spec.
 _FORCE_SCALE_N = 0.1
 
@@ -67,6 +74,7 @@ _DEFAULT_MEDIAN_WINDOW = 3
 _DEFAULT_SERIAL_SETTLE_S = 0.75
 _DEFAULT_RESPONSE_TIMEOUT_S = 1.0
 _DEFAULT_STARTUP_ATTEMPTS = 3
+_DEFAULT_MAX_CONSECUTIVE_ERROR_FRAMES = 30
 
 _PAXINI_ID_STRING = "paxini"
 
@@ -151,6 +159,9 @@ class PaxiniConfig:
         response_timeout_s: Seconds to wait for one complete AA56 frame.
         startup_attempts: Number of times to retry the auto-push enable
             sequence if the first AA56 frames do not arrive.
+        max_consecutive_error_frames: Number of consecutive checksum-valid
+            AA56 frames with a non-zero board error code to tolerate. Isolated
+            error frames are dropped; a persistent run stops the reader.
         serial_settle_s: Seconds to wait after opening the port before writing.
         dtr: USB serial DTR line state. False is the Paxini board default.
         rts: USB serial RTS line state. True is the Paxini board default.
@@ -166,6 +177,7 @@ class PaxiniConfig:
     median_window: int = _DEFAULT_MEDIAN_WINDOW
     response_timeout_s: float = _DEFAULT_RESPONSE_TIMEOUT_S
     startup_attempts: int = _DEFAULT_STARTUP_ATTEMPTS
+    max_consecutive_error_frames: int = _DEFAULT_MAX_CONSECUTIVE_ERROR_FRAMES
     serial_settle_s: float = _DEFAULT_SERIAL_SETTLE_S
     dtr: bool = False
     rts: bool = True
@@ -215,11 +227,173 @@ def _build_adapter_write_frame(address: int, payload: bytes) -> bytes:
     return frame + bytes([_lrc(frame)])
 
 
+def _build_adapter_read_frame(address: int, length: int) -> bytes:
+    if not 1 <= length <= 512:
+        raise ValueError(f"Register read length must be in 1..512, got {length}")
+    frame = (
+        _FRAME_HEAD_REQUEST
+        + bytes([0x00, 0x03])
+        + address.to_bytes(2, "little")
+        + length.to_bytes(2, "little")
+    )
+    return frame + bytes([_lrc(frame)])
+
+
 def _write_no_ack(ser: serial.Serial, address: int, payload: bytes) -> None:
     """Write an adapter register without waiting for an acknowledgement."""
     frame = _build_adapter_write_frame(address, payload)
     ser.write(frame)
     logger.debug("TX adapter no-ack %s", frame.hex(" ").upper())
+
+
+def _read_adapter_register(
+    ser: serial.Serial,
+    address: int,
+    length: int,
+    *,
+    timeout_s: float,
+) -> bytes:
+    """Read one high-speed-board register response (AA55 framing)."""
+    request = _build_adapter_read_frame(address, length)
+    try:
+        ser.write(request)
+        ser.flush()
+    except (OSError, serial.SerialException) as exc:
+        raise _serial_io_error(ser, f"reading register 0x{address:04X}", exc) from exc
+
+    deadline = time.monotonic() + timeout_s
+    buffer = bytearray()
+    while time.monotonic() < deadline:
+        try:
+            waiting = ser.in_waiting
+            if waiting:
+                buffer.extend(ser.read(waiting))
+            else:
+                time.sleep(0.001)
+        except (OSError, serial.SerialException) as exc:
+            raise _serial_io_error(
+                ser, f"receiving register 0x{address:04X}", exc
+            ) from exc
+
+        head = buffer.find(b"\xAA\x55")
+        if head < 0:
+            if len(buffer) > 1:
+                del buffer[:-1]
+            continue
+        if head:
+            del buffer[:head]
+        if len(buffer) < 8:
+            continue
+
+        response_length = int.from_bytes(buffer[6:8], "little")
+        total_length = 8 + response_length + 1
+        if len(buffer) < total_length:
+            continue
+        frame = bytes(buffer[:total_length])
+        if frame[-1] != _lrc(frame[:-1]):
+            raise RuntimeError(
+                f"LRC mismatch reading Paxini register 0x{address:04X}"
+            )
+        function_code = frame[3]
+        response_address = int.from_bytes(frame[4:6], "little")
+        if function_code & 0x80:
+            raise RuntimeError(
+                f"Paxini board returned error 0x{function_code & 0x7F:02X} "
+                f"reading register 0x{address:04X}"
+            )
+        if function_code != 0x03 or response_address != address:
+            raise RuntimeError(
+                "Unexpected Paxini register response: "
+                f"function=0x{function_code:02X}, address=0x{response_address:04X}; "
+                f"expected function=0x03, address=0x{address:04X}"
+            )
+        data = frame[8 : 8 + response_length]
+        if len(data) < length:
+            raise RuntimeError(
+                f"Short Paxini register 0x{address:04X} response: "
+                f"expected {length} bytes, got {len(data)}"
+            )
+        logger.debug(
+            "RX register 0x%04X (%d bytes): %s",
+            address,
+            length,
+            data[:length].hex(" ").upper(),
+        )
+        return data[:length]
+
+    raise TimeoutError(
+        f"No response reading Paxini register 0x{address:04X} "
+        f"within {timeout_s:.1f}s"
+    )
+
+
+def _active_module_indices(bitmap: bytes) -> list[int]:
+    if len(bitmap) != 4:
+        raise ValueError(f"Expected 4 active-module bytes, got {len(bitmap)}")
+    return [
+        module_index
+        for module_index in range(_MODULE_COUNT)
+        if bitmap[module_index // 8] & (1 << (module_index % 8))
+    ]
+
+
+def _discover_fingers(
+    ser: serial.Serial,
+    configured_fingers: list[_Finger],
+    *,
+    timeout_s: float,
+) -> list[_Finger]:
+    """Resolve payload order and point counts from board registers."""
+    bitmap = _read_adapter_register(
+        ser, _ADDR_ACTIVE_MODULES, 4, timeout_s=timeout_s
+    )
+    active_modules = _active_module_indices(bitmap)
+    raw_counts = _read_adapter_register(
+        ser,
+        _ADDR_DISTRIBUTION_POINT_COUNTS,
+        _MODULE_COUNT * 2,
+        timeout_s=timeout_s,
+    )
+    data_type = _read_adapter_register(
+        ser, _ADDR_DATA_TYPE, 1, timeout_s=timeout_s
+    )[0]
+    if data_type != _DATA_TYPE_RESULTANT_AND_DISTRIBUTED:
+        raise RuntimeError(
+            f"Paxini data type read back as 0x{data_type:02X}; expected 0x03 "
+            "(resultant + distributed force)"
+        )
+    if len(active_modules) != len(configured_fingers):
+        raise RuntimeError(
+            f"Paxini reports {len(active_modules)} active modules "
+            f"({active_modules}), but {len(configured_fingers)} fingers were "
+            f"configured ({[finger.name for finger in configured_fingers]})"
+        )
+
+    discovered: list[_Finger] = []
+    for finger, module_index in zip(configured_fingers, active_modules):
+        offset = module_index * 2
+        point_count = int.from_bytes(raw_counts[offset : offset + 2], "little")
+        if point_count <= 0:
+            raise RuntimeError(
+                f"Paxini module {module_index} for finger {finger.name!r} "
+                f"reported invalid distributed-force point count {point_count}"
+            )
+        discovered.append(
+            _Finger(
+                name=finger.name,
+                device_address=module_index + 1,
+                force_points=point_count,
+            )
+        )
+    logger.info(
+        "Discovered Paxini layout: %s",
+        ", ".join(
+            f"{finger.name}=module {finger.device_address - 1} "
+            f"({finger.force_points} points)"
+            for finger in discovered
+        ),
+    )
+    return discovered
 
 
 def _serial_port_label(ser: serial.Serial) -> str:
@@ -331,13 +505,34 @@ def _read_frame(
 
 
 def _parse_frame_payload(frame: bytes) -> bytes:
-    """Return the payload bytes between the header and the LRC."""
+    """Return valid force data from one checksum-verified AA56 frame.
+
+    The protocol layout is ``AA 56 | reserved | length | error | data | LRC``.
+    ``length`` includes the one-byte error field but excludes the LRC.
+    """
+    if len(frame) < 7 or frame[:2] != _FRAME_HEAD_AUTO_PUSH:
+        raise ValueError("Not a complete Paxini AA56 auto-push frame")
     valid_frame_len = int.from_bytes(frame[3:5], "little")
     total_len = 5 + valid_frame_len + 1
+    if len(frame) != total_len:
+        raise ValueError(
+            f"AA56 frame length mismatch: header declares {total_len} bytes, "
+            f"received {len(frame)}"
+        )
     status = frame[5]
     if status != 0:
-        raise RuntimeError(f"Auto-push status byte is 0x{status:02X} (non-zero indicates board error)")
+        raise _AutoPushBoardError(status, total_len)
     return frame[6 : total_len - 1]
+
+
+class _AutoPushBoardError(RuntimeError):
+    def __init__(self, status: int, frame_length: int) -> None:
+        self.status = status
+        self.frame_length = frame_length
+        super().__init__(
+            f"Auto-push board error 0x{status:02X} "
+            f"in checksum-valid {frame_length}-byte frame"
+        )
 
 
 def _parse_force_vectors(
@@ -379,19 +574,20 @@ def _parse_digits(
         6 bytes  — resultant force (3 × int16 Fx/Fy/Fz), skipped here
         N × 3 bytes — distributed force points
     """
+    expected_payload_len = sum(6 + finger.force_points * 3 for finger in fingers)
+    if len(payload) != expected_payload_len:
+        raise ValueError(
+            f"Auto-push payload length is {len(payload)} bytes; discovered "
+            f"module layout requires exactly {expected_payload_len}. The active "
+            "module set or point-count configuration may have changed."
+        )
+
     offset = 0
     result: dict[str, np.ndarray] = {}
     for finger in fingers:
         resultant_len = 6
         data_len = finger.force_points * 3
         block_len = resultant_len + data_len
-        if len(payload) < offset + block_len:
-            raise ValueError(
-                f"Auto-push payload too short for finger {finger.name!r}: "
-                f"payload has {len(payload)} bytes but need at least "
-                f"{offset + block_len}. "
-                f"Verify that {finger.name!r} is physically connected to the board."
-            )
         force_data = payload[offset + resultant_len : offset + block_len]
         result[finger.name] = _parse_force_vectors(
             force_data, finger.force_points, scale_n=scale_n, signed_z=signed_z
@@ -539,6 +735,15 @@ class PaxiniHandSensor:
                 ser.flush()
                 time.sleep(0.05)
                 _drain(ser)
+
+                # Auto-push frames contain packed force bytes only. Discover
+                # the active module order and each module's point count before
+                # enabling the stream so frame boundaries can be validated.
+                self._fingers = _discover_fingers(
+                    ser,
+                    _build_fingers(self.config.fingers),
+                    timeout_s=self.config.response_timeout_s,
+                )
                 ser.reset_input_buffer()
                 self._buffer.clear()
 
@@ -579,6 +784,14 @@ class PaxiniHandSensor:
                 except (OSError, serial.SerialException):
                     pass
                 time.sleep(0.2)
+            except Exception:
+                try:
+                    ser.write(_DISABLE_AUTO_PUSH)
+                    ser.flush()
+                except (OSError, serial.SerialException):
+                    pass
+                ser.close()
+                raise
 
         if frame is None:
             ser.close()
@@ -591,8 +804,29 @@ class PaxiniHandSensor:
             ) from last_timeout
 
         try:
+            # Startup can contain transient board-error frames. Skip them just
+            # as the runtime reader does, but retain a finite failure bound.
+            error_count = 0
+            while True:
+                try:
+                    payload = _parse_frame_payload(frame)
+                    break
+                except _AutoPushBoardError as exc:
+                    error_count += 1
+                    if error_count >= max(
+                        1, self.config.max_consecutive_error_frames
+                    ):
+                        raise RuntimeError(
+                            "Paxini board error persisted during startup for "
+                            f"{error_count} consecutive frames; last status "
+                            f"was 0x{exc.status:02X}"
+                        ) from exc
+                    logger.warning("Dropping startup %s", exc)
+                    frame = _read_frame(
+                        ser, self.config.response_timeout_s, self._buffer
+                    )
             _parse_digits(
-                _parse_frame_payload(frame),
+                payload,
                 self._fingers,
                 scale_n=self.config.scale_n,
                 signed_z=self.config.signed_z,
@@ -725,6 +959,11 @@ class PaxiniHandSensor:
         median_buf: deque[dict[str, np.ndarray]] = deque(
             maxlen=max(1, self.config.median_window)
         )
+        consecutive_board_errors = 0
+        total_board_errors = 0
+        max_consecutive_errors = max(
+            1, self.config.max_consecutive_error_frames
+        )
         try:
             while not self._stop.is_set():
                 frame = _read_frame(
@@ -732,8 +971,36 @@ class PaxiniHandSensor:
                     self.config.response_timeout_s,
                     self._buffer,
                 )
+                try:
+                    payload = _parse_frame_payload(frame)
+                except _AutoPushBoardError as exc:
+                    consecutive_board_errors += 1
+                    total_board_errors += 1
+                    # Avoid flooding stderr during a persistent hardware fault,
+                    # while retaining the first frame and periodic progress.
+                    if (
+                        consecutive_board_errors == 1
+                        or consecutive_board_errors % 10 == 0
+                    ):
+                        logger.warning(
+                            "Dropping Paxini error frame: status=0x%02X, "
+                            "frame_length=%d, consecutive=%d, total=%d",
+                            exc.status,
+                            exc.frame_length,
+                            consecutive_board_errors,
+                            total_board_errors,
+                        )
+                    if consecutive_board_errors >= max_consecutive_errors:
+                        raise RuntimeError(
+                            "Paxini board error persisted for "
+                            f"{consecutive_board_errors} consecutive frames; "
+                            f"last status was 0x{exc.status:02X}. Check sensor "
+                            "power/cabling and reconnect to rediscover the module layout."
+                        ) from exc
+                    continue
+                consecutive_board_errors = 0
                 sample = _parse_digits(
-                    _parse_frame_payload(frame),
+                    payload,
                     self._fingers,
                     scale_n=self.config.scale_n,
                     signed_z=self.config.signed_z,
